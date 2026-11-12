@@ -1,11 +1,8 @@
-
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import type { User } from '@supabase/supabase-js'
-
 import {
   Link2, Plus, Search, Star, Trash2, ExternalLink,
-  Globe, Code2, BookOpen, Smartphone, Laptop,
-  LayoutDashboard, Heart, Copy, X
+  Copy, X, LogOut, LayoutDashboard,
 } from 'lucide-react'
 
 import { supabase } from './lib/supabase'
@@ -23,105 +20,78 @@ type SavedLink = {
   updated_at: string
 }
 
+type Tab = 'All links' | 'Favorites'
+
+const getHost = (url: string) => {
+  try { return new URL(url).hostname.replace(/^www\./, '') } catch { return url }
+}
+
+const timeAgo = (iso: string) => {
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  if (days < 30) return `${days}d ago`
+  return new Date(iso).toLocaleDateString()
+}
+
+function Favicon({ host }: { host: string }) {
+  const [failed, setFailed] = useState(false)
+  return (
+    <div className="favicon" aria-hidden="true">
+      {failed ? host.charAt(0).toUpperCase() : (
+        <img
+          src={`https://www.google.com/s2/favicons?domain=${host}&sz=64`}
+          alt=""
+          loading="lazy"
+          onError={() => setFailed(true)}
+        />
+      )}
+    </div>
+  )
+}
+
 function App() {
-  // Authentication state
   const [user, setUser] = useState<User | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
 
-  // Links state
   const [links, setLinks] = useState<SavedLink[]>([])
   const [linksLoading, setLinksLoading] = useState(false)
   const [savingLink, setSavingLink] = useState(false)
 
-  // Dashboard state
   const [search, setSearch] = useState('')
-  const [activeTab, setActiveTab] = useState('All Links')
+  const [activeTab, setActiveTab] = useState<Tab>('All links')
   const [showForm, setShowForm] = useState(false)
   const [title, setTitle] = useState('')
   const [url, setUrl] = useState('')
+  const [toDelete, setToDelete] = useState<SavedLink | null>(null)
+  const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null)
+  const toastTimer = useRef<number | undefined>(undefined)
 
+  const notify = useCallback((msg: string, error = false) => {
+    window.clearTimeout(toastTimer.current)
+    setToast({ msg, error })
+    toastTimer.current = window.setTimeout(() => setToast(null), 2600)
+  }, [])
 
-useEffect(() => {
-  if (!user) return
-
-  const channel = supabase
-    .channel(`links-changes-${user.id}`)
-    .on(
-      'postgres_changes',
-      {
-        event: '*',
-        schema: 'public',
-        table: 'links',
-        filter: `user_id=eq.${user.id}`,
-      },
-      (payload) => {
-        if (payload.eventType === 'INSERT') {
-          const newLink = payload.new as SavedLink
-
-          setLinks((prev) => {
-            if (prev.some((link) => link.id === newLink.id)) {
-              return prev
-            }
-
-            return [newLink, ...prev]
-          })
-        }
-
-        if (payload.eventType === 'UPDATE') {
-          const updatedLink = payload.new as SavedLink
-
-          setLinks((prev) =>
-            prev.map((link) =>
-              link.id === updatedLink.id ? updatedLink : link
-            )
-          )
-        }
-
-        if (payload.eventType === 'DELETE') {
-          const deletedId = payload.old.id
-
-          setLinks((prev) =>
-            prev.filter((link) => link.id !== deletedId)
-          )
-        }
-      }
-    )
-    .subscribe()
-
-  return () => {
-    supabase.removeChannel(channel)
-  }
-}, [user])
-
-
-  // Get authenticated user session
+  // Auth session
   useEffect(() => {
     let mounted = true
 
-    const getSession = async () => {
-      const { data: { session }, error } =
-        await supabase.auth.getSession()
-
+    supabase.auth.getSession().then(({ data: { session }, error }) => {
       if (!mounted) return
-
-      if (error) {
-        console.error('Session error:', error.message)
-      }
-
-      setUser(session?.user ?? null)
-      setAuthLoading(false)
-    }
-
-    const {
-      data: { subscription }
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!mounted) return
-
+      if (error) console.error('Session error:', error.message)
       setUser(session?.user ?? null)
       setAuthLoading(false)
     })
 
-    getSession()
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => {
+      if (!mounted) return
+      setUser(session?.user ?? null)
+      setAuthLoading(false)
+    })
 
     return () => {
       mounted = false
@@ -129,7 +99,7 @@ useEffect(() => {
     }
   }, [])
 
-  // Fetch links belonging to the logged-in user
+  // Initial fetch
   useEffect(() => {
     let active = true
 
@@ -139,77 +109,107 @@ useEffect(() => {
         setLinksLoading(false)
         return
       }
-
       setLinksLoading(true)
-
       const { data, error } = await supabase
         .from('links')
         .select('*')
         .order('created_at', { ascending: false })
 
       if (!active) return
-
       if (error) {
         console.error('Error fetching links:', error.message)
-        alert('Unable to load your links: ' + error.message)
+        notify('Could not load your links. Check your connection and refresh.', true)
       } else {
         setLinks((data ?? []) as SavedLink[])
       }
-
       setLinksLoading(false)
     }
 
     fetchLinks()
+    return () => { active = false }
+  }, [user, notify])
 
-    return () => {
-      active = false
-    }
+  // Realtime sync across devices
+  useEffect(() => {
+    if (!user) return
+
+    const channel = supabase
+      .channel(`links-changes-${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'links', filter: `user_id=eq.${user.id}` },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const row = payload.new as SavedLink
+            setLinks(prev => prev.some(l => l.id === row.id) ? prev : [row, ...prev])
+          }
+          if (payload.eventType === 'UPDATE') {
+            const row = payload.new as SavedLink
+            setLinks(prev => prev.map(l => (l.id === row.id ? row : l)))
+          }
+          if (payload.eventType === 'DELETE') {
+            const id = payload.old.id
+            setLinks(prev => prev.filter(l => l.id !== id))
+          }
+        }
+      )
+      .subscribe()
+
+    return () => { supabase.removeChannel(channel) }
   }, [user])
 
-  // Filter links by search and selected tab
+  // Close modals with Escape
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setShowForm(false); setToDelete(null) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  // Stop the page behind a dialog from scrolling
+  useEffect(() => {
+    document.body.style.overflow = showForm || toDelete ? 'hidden' : ''
+    return () => { document.body.style.overflow = '' }
+  }, [showForm, toDelete])
+
+  const favoriteCount = useMemo(() => links.filter(l => l.favorite).length, [links])
+
   const filteredLinks = useMemo(() => {
+    const term = search.trim().toLowerCase()
     return links.filter(link => {
-      const searchTerm = search.toLowerCase()
-
-      const matchesSearch =
-        link.title.toLowerCase().includes(searchTerm) ||
-        link.url.toLowerCase().includes(searchTerm)
-
-      const matchesTab =
-        activeTab === 'All Links' ||
-        (activeTab === 'Favorites' && link.favorite)
-
+      const matchesSearch = !term ||
+        link.title.toLowerCase().includes(term) ||
+        link.url.toLowerCase().includes(term)
+      const matchesTab = activeTab === 'All links' || link.favorite
       return matchesSearch && matchesTab
     })
   }, [links, search, activeTab])
 
-  // Add new link to Supabase
+  const closeForm = () => { setShowForm(false); setTitle(''); setUrl('') }
+
   const addLink = async (e: React.FormEvent) => {
     e.preventDefault()
-
-    if (!title.trim() || !url.trim() || !user) return
+    if (!url.trim() || !user) return
 
     let formattedUrl = url.trim()
-
-    if (!/^https?:\/\//i.test(formattedUrl)) {
-      formattedUrl = `https://${formattedUrl}`
-    }
+    if (!/^https?:\/\//i.test(formattedUrl)) formattedUrl = `https://${formattedUrl}`
 
     try {
       new URL(formattedUrl)
     } catch {
-      alert('Please enter a valid URL.')
+      notify('That doesn’t look like a valid URL.', true)
       return
     }
 
     setSavingLink(true)
-
     try {
       const { data, error } = await supabase
         .from('links')
         .insert({
           user_id: user.id,
-          title: title.trim(),
+          // Title is optional: fall back to the site name
+          title: title.trim() || getHost(formattedUrl),
           url: formattedUrl,
           category: 'General',
           favorite: false,
@@ -219,486 +219,303 @@ useEffect(() => {
 
       if (error) {
         console.error('Error adding link:', error.message)
-        alert('Unable to save link: ' + error.message)
+        notify('Could not save the link. Try again.', true)
         return
       }
 
-      setLinks(prev => [data as SavedLink, ...prev])
-
-      setTitle('')
-      setUrl('')
-      setShowForm(false)
+      const row = data as SavedLink
+      // Realtime may have delivered this row already, so avoid duplicates
+      setLinks(prev => prev.some(l => l.id === row.id) ? prev : [row, ...prev])
+      closeForm()
+      notify('Link saved')
     } finally {
       setSavingLink(false)
     }
   }
 
-  // Toggle favorite in Supabase
-  const toggleFavorite = async (id: string) => {
-    const link = links.find(item => item.id === id)
-
-    if (!link) return
-
-    const { data, error } = await supabase
-      .from('links')
-      .update({
-        favorite: !link.favorite,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    if (error) {
-      console.error('Error updating favorite:', error.message)
-      alert('Unable to update favorite: ' + error.message)
-      return
-    }
-
-    setLinks(prev =>
-      prev.map(item =>
-        item.id === id ? data as SavedLink : item
-      )
-    )
-  }
-
-  // Delete link from Supabase
-  const deleteLink = async (id: string) => {
-    const confirmed = window.confirm(
-      'Are you sure you want to delete this link?'
-    )
-
-    if (!confirmed) return
+  const toggleFavorite = async (link: SavedLink) => {
+    const next = !link.favorite
+    // Optimistic update
+    setLinks(prev => prev.map(l => (l.id === link.id ? { ...l, favorite: next } : l)))
 
     const { error } = await supabase
       .from('links')
-      .delete()
-      .eq('id', id)
+      .update({ favorite: next, updated_at: new Date().toISOString() })
+      .eq('id', link.id)
 
     if (error) {
-      console.error('Error deleting link:', error.message)
-      alert('Unable to delete link: ' + error.message)
-      return
+      console.error('Error updating favorite:', error.message)
+      setLinks(prev => prev.map(l => (l.id === link.id ? { ...l, favorite: link.favorite } : l)))
+      notify('Could not update favorite.', true)
     }
-
-    setLinks(prev => prev.filter(link => link.id !== id))
   }
 
-  // Copy URL
+  const confirmDelete = async () => {
+    if (!toDelete) return
+    const target = toDelete
+    setToDelete(null)
+
+    const { error } = await supabase.from('links').delete().eq('id', target.id)
+    if (error) {
+      console.error('Error deleting link:', error.message)
+      notify('Could not delete the link.', true)
+      return
+    }
+    setLinks(prev => prev.filter(l => l.id !== target.id))
+    notify('Link deleted')
+  }
+
   const copyLink = async (value: string) => {
     try {
       await navigator.clipboard.writeText(value)
-      alert('Link copied!')
+      notify('Link copied')
     } catch {
-      alert('Could not copy link.')
+      notify('Could not copy the link.', true)
     }
   }
 
-  // Logout
   const handleLogout = async () => {
     const { error } = await supabase.auth.signOut()
-
-    if (error) {
-      console.error('Logout error:', error.message)
-      alert('Unable to logout: ' + error.message)
-    }
+    if (error) notify('Could not log out. Try again.', true)
   }
 
-  // Authentication loading screen
-  if (authLoading) {
-    return (
-      <div className="auth-page">
-        Loading LinkBridge...
-      </div>
-    )
-  }
+  if (authLoading) return <div className="auth-page">Loading LinkBridge…</div>
+  if (!user) return <Auth />
 
-  // Show authentication screen when logged out
-  if (!user) {
-    return <Auth />
-  }
+  const initial = (user.email ?? 'U').charAt(0).toUpperCase()
+  const isFavs = activeTab === 'Favorites'
 
-  // Main dashboard
+  const searchBox = () => (
+    <div className="search-box">
+      <Search size={18} />
+      <input
+        type="search"
+        placeholder="Search by title or URL"
+        aria-label="Search links"
+        value={search}
+        onChange={e => setSearch(e.target.value)}
+      />
+      {search && (
+        <button className="icon-btn" aria-label="Clear search" onClick={() => setSearch('')}>
+          <X size={16} />
+        </button>
+      )}
+    </div>
+  )
+
   return (
     <div className="app-shell">
-
-      {/* Sidebar */}
+      {/* Sidebar (desktop / tablet) */}
       <aside className="sidebar">
-
         <div className="brand">
-          <div className="brand-icon">
-            <Link2 size={23} />
-          </div>
-
-          <span>
-            Link<span className="brand-accent">Bridge</span>
-          </span>
+          <div className="brand-icon"><Link2 size={20} /></div>
+          <span>Link<span className="brand-accent">Bridge</span></span>
         </div>
 
-        <div className="sidebar-label">
-          WORKSPACE
-        </div>
-
-        <nav>
-          <button
-            className={`nav-item ${
-              activeTab === 'All Links' ? 'active' : ''
-            }`}
-            onClick={() => setActiveTab('All Links')}
-          >
-            <LayoutDashboard size={18} />
-            All Links
-            <span className="nav-count">
-              {links.length}
-            </span>
+        <nav className="nav-list" aria-label="Collections">
+          <button className={`nav-item ${!isFavs ? 'active' : ''}`} onClick={() => setActiveTab('All links')}>
+            <LayoutDashboard size={18} /> All links
+            <span className="nav-count">{links.length}</span>
           </button>
-
-          <button
-            className={`nav-item ${
-              activeTab === 'Favorites' ? 'active' : ''
-            }`}
-            onClick={() => setActiveTab('Favorites')}
-          >
-            <Heart size={18} />
-            Favorites
+          <button className={`nav-item ${isFavs ? 'active' : ''}`} onClick={() => setActiveTab('Favorites')}>
+            <Star size={18} /> Favorites
+            <span className="nav-count">{favoriteCount}</span>
           </button>
         </nav>
 
         <div className="sidebar-bottom">
-
-          <div className="sync-card">
-            <div className="sync-icon">
-              <Globe size={19} />
-            </div>
-
-            <strong>Access everywhere</strong>
-
-            <p>
-              Your links are securely stored in the cloud
-              and available across your devices.
-            </p>
-          </div>
-
           <div className="profile">
-            <div className="avatar">LB</div>
-
-            <div>
-              <strong>My Workspace</strong>
-              <small>{user.email}</small>
+            <div className="avatar">{initial}</div>
+            <div className="profile-text">
+              <strong>Signed in</strong>
+              <small title={user.email ?? ''}>{user.email}</small>
             </div>
+            <button className="icon-btn" title="Log out" aria-label="Log out" onClick={handleLogout}>
+              <LogOut size={18} />
+            </button>
           </div>
-
         </div>
       </aside>
 
-      {/* Main content */}
       <main className="main-content">
-
         <header className="topbar">
-
-          <div className="breadcrumb">
-            Workspace <span>/</span> {activeTab}
-          </div>
-
-          <div className="device-status">
-            <span className="status-dot" />
-            Cloud connected
-
-            <button
-              className="primary-button"
-              onClick={handleLogout}
-            >
-              Logout
-            </button>
-          </div>
-
+          {searchBox()}
+          <div className="topbar-spacer" />
+          <button className="btn primary desktop-add" onClick={() => setShowForm(true)}>
+            <Plus size={18} /> Add link
+          </button>
         </header>
 
         <section className="page-content">
-
-          {/* Welcome section */}
-          <div className="welcome-row">
-
-            <div>
-              <div className="eyebrow">
-                YOUR PERSONAL LINK MANAGER
-              </div>
-
-              <h1>
-                {activeTab === 'All Links'
-                  ? 'Your links, one place.'
-                  : 'Your favorites.'}
-              </h1>
-
-              <p className="subtitle">
-                Save it once. Access it anywhere.
-              </p>
+          <div className="mobile-brand mobile-only">
+            <div className="brand">
+              <div className="brand-icon"><Link2 size={20} /></div>
+              <span>Link<span className="brand-accent">Bridge</span></span>
             </div>
-
-            <button
-              className="primary-button"
-              onClick={() => setShowForm(true)}
-            >
-              <Plus size={18} />
-              Add new link
+            <button className="icon-btn" title="Log out" aria-label="Log out" onClick={handleLogout}>
+              <LogOut size={20} />
             </button>
-
           </div>
 
-          {/* Statistics */}
-          <div className="stats-grid">
-
-            <div className="stat-card">
-              <div className="stat-icon blue">
-                <Link2 size={20} />
-              </div>
-
-              <div>
-                <span>Total links</span>
-                <strong>{links.length}</strong>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon yellow">
-                <Star size={20} />
-              </div>
-
-              <div>
-                <span>Favorites</span>
-                <strong>
-                  {links.filter(link => link.favorite).length}
-                </strong>
-              </div>
-            </div>
-
-            <div className="stat-card">
-              <div className="stat-icon green">
-                <Smartphone size={20} />
-              </div>
-
-              <div>
-                <span>Connected devices</span>
-                <strong>1</strong>
-              </div>
-            </div>
-
-          </div>
-
-          {/* Links section */}
-          <div className="section-heading">
-
+          <div className="page-head">
             <div>
-              <h2>{activeTab}</h2>
-
+              <h1>{isFavs ? 'Favorites' : 'All links'}</h1>
               <p>
-                {filteredLinks.length} saved{' '}
-                {filteredLinks.length === 1 ? 'link' : 'links'}
+                {filteredLinks.length} {filteredLinks.length === 1 ? 'link' : 'links'}
+                {search.trim() ? ` matching “${search.trim()}”` : ''}
               </p>
             </div>
-
-            <div className="search-box">
-              <Search size={17} />
-
-              <input
-                placeholder="Search your links..."
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-              />
-
-              {search && (
-                <button onClick={() => setSearch('')}>
-                  <X size={15} />
-                </button>
-              )}
-            </div>
-
           </div>
 
-          {/* Links list */}
+          <div className="mobile-search mobile-only">{searchBox()}</div>
+
           <div className="links-list">
+            {linksLoading && [0, 1, 2].map(i => <div className="skeleton" key={i} />)}
 
-            {linksLoading && (
-              <div className="empty-state">
-                Loading your links...
-              </div>
-            )}
+            {!linksLoading && filteredLinks.map(link => {
+              const host = getHost(link.url)
+              return (
+                <article className="link-card" key={link.id}>
+                  <Favicon host={host} />
 
-            {!linksLoading && filteredLinks.map(link => (
+                  <div className="link-details">
+                    <a className="link-title" href={link.url} target="_blank" rel="noreferrer">
+                      {link.title}
+                    </a>
+                    <div className="link-meta">{host} · {timeAgo(link.created_at)}</div>
+                  </div>
 
-              <article className="link-card" key={link.id}>
-
-                <div className="link-type-icon">
-                  {link.category === 'Development'
-                    ? <Code2 size={21} />
-                    : link.category === 'Learning'
-                      ? <BookOpen size={21} />
-                      : <Globe size={21} />}
-                </div>
-
-                <div className="link-details">
-
-                  <h3>{link.title}</h3>
-
-                  <a
-                    href={link.url}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {link.url}
-                  </a>
-
-                  <span className="category-tag">
-                    {link.category}
-                  </span>
-
-                </div>
-
-                <div className="link-actions">
-
-                  <button
-                    title="Copy link"
-                    onClick={() => copyLink(link.url)}
-                  >
-                    <Copy size={17} />
-                  </button>
-
-                  <button
-                    title="Favorite"
-                    className={
-                      link.favorite
-                        ? 'favorite selected'
-                        : 'favorite'
-                    }
-                    onClick={() => toggleFavorite(link.id)}
-                  >
-                    <Star
-                      size={18}
-                      fill={
-                        link.favorite
-                          ? 'currentColor'
-                          : 'none'
-                      }
-                    />
-                  </button>
-
-                  <a
-                    title="Open link"
-                    href={link.url}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    <ExternalLink size={18} />
-                  </a>
-
-                  <button
-                    title="Delete link"
-                    onClick={() => deleteLink(link.id)}
-                  >
-                    <Trash2 size={18} />
-                  </button>
-
-                </div>
-
-              </article>
-
-            ))}
+                  <div className="link-actions">
+                    <button
+                      className={`icon-btn fav ${link.favorite ? 'on' : ''}`}
+                      title={link.favorite ? 'Remove from favorites' : 'Add to favorites'}
+                      aria-label={link.favorite ? 'Remove from favorites' : 'Add to favorites'}
+                      aria-pressed={link.favorite}
+                      onClick={() => toggleFavorite(link)}
+                    >
+                      <Star size={18} fill={link.favorite ? 'currentColor' : 'none'} />
+                    </button>
+                    <button className="icon-btn" title="Copy link" aria-label="Copy link" onClick={() => copyLink(link.url)}>
+                      <Copy size={18} />
+                    </button>
+                    <a className="icon-btn" title="Open link" aria-label="Open link" href={link.url} target="_blank" rel="noreferrer">
+                      <ExternalLink size={18} />
+                    </a>
+                    <button className="icon-btn danger" title="Delete link" aria-label="Delete link" onClick={() => setToDelete(link)}>
+                      <Trash2 size={18} />
+                    </button>
+                  </div>
+                </article>
+              )
+            })}
 
             {!linksLoading && filteredLinks.length === 0 && (
               <div className="empty-state">
-
                 <Link2 size={32} />
-
-                <h3>No links found</h3>
-
-                <p>
-                  Try another search or add your first link.
-                </p>
-
+                {search.trim() ? (
+                  <>
+                    <h3>No matches</h3>
+                    <p>Try a different title or part of the URL.</p>
+                  </>
+                ) : isFavs ? (
+                  <>
+                    <h3>No favorites yet</h3>
+                    <p>Tap the star on a link to pin it here.</p>
+                  </>
+                ) : (
+                  <>
+                    <h3>Save your first link</h3>
+                    <p>Anything you save shows up on all your devices.</p>
+                    <button className="btn primary desktop-add" onClick={() => setShowForm(true)}>
+                      <Plus size={18} /> Add link
+                    </button>
+                  </>
+                )}
               </div>
             )}
-
           </div>
-
-          <div className="preview-note">
-            <Laptop size={17} />
-
-            <span>
-              Your links are securely synced with Supabase.
-            </span>
-          </div>
-
         </section>
       </main>
 
+      {/* Bottom nav (mobile) */}
+      <nav className="bottom-nav" aria-label="Collections">
+        <button className={`nav-item ${!isFavs ? 'active' : ''}`} onClick={() => setActiveTab('All links')}>
+          <LayoutDashboard size={20} /> All
+        </button>
+        <button className="fab" aria-label="Add link" onClick={() => setShowForm(true)}>
+          <Plus size={26} />
+        </button>
+        <button className={`nav-item ${isFavs ? 'active' : ''}`} onClick={() => setActiveTab('Favorites')}>
+          <Star size={20} /> Favorites
+        </button>
+      </nav>
+
       {/* Add link modal */}
       {showForm && (
-
-        <div
-          className="modal-backdrop"
-          onClick={() => setShowForm(false)}
-        >
-
-          <form
-            className="link-modal"
-            onSubmit={addLink}
-            onClick={e => e.stopPropagation()}
-          >
-
+        <div className="modal-backdrop" onClick={closeForm}>
+          <form className="link-modal" onSubmit={addLink} onClick={e => e.stopPropagation()}>
             <div className="modal-heading">
-
               <div>
-                <h2>Add a new link</h2>
-
-                <p>
-                  Save a URL to your LinkBridge collection.
-                </p>
+                <h2>Add a link</h2>
+                <p>Paste a URL. The title is optional.</p>
               </div>
-
-              <button
-                type="button"
-                onClick={() => setShowForm(false)}
-              >
+              <button type="button" className="icon-btn" aria-label="Close" onClick={closeForm}>
                 <X size={20} />
               </button>
-
             </div>
 
-            <label>Link title</label>
-
+            <label htmlFor="link-url">URL</label>
             <input
-              value={title}
-              onChange={e => setTitle(e.target.value)}
-              placeholder="e.g. My favourite website"
-              required
-            />
-
-            <label>URL</label>
-
-            <input
-              type="text"
+              id="link-url"
+              autoFocus={window.matchMedia('(min-width: 821px)').matches}
+              inputMode="url"
+              autoCapitalize="none"
+              autoCorrect="off"
               value={url}
               onChange={e => setUrl(e.target.value)}
-              placeholder="https://example.com"
+              placeholder="example.com/article"
               required
             />
 
-            <button
-              className="primary-button modal-submit"
-              type="submit"
-              disabled={savingLink}
-            >
-              <Plus size={17} />
+            <label htmlFor="link-title">Title</label>
+            <input
+              id="link-title"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+              placeholder="Defaults to the site name"
+            />
 
-              {savingLink ? 'Saving...' : 'Save link'}
-            </button>
-
+            <div className="modal-actions">
+              <button type="button" className="btn ghost" onClick={closeForm}>Cancel</button>
+              <button type="submit" className="btn primary" disabled={savingLink}>
+                {savingLink ? 'Saving…' : 'Save link'}
+              </button>
+            </div>
           </form>
-
         </div>
-
       )}
 
+      {/* Delete confirmation */}
+      {toDelete && (
+        <div className="modal-backdrop" onClick={() => setToDelete(null)}>
+          <div className="link-modal" role="alertdialog" aria-labelledby="del-title" onClick={e => e.stopPropagation()}>
+            <h2 id="del-title" style={{ fontSize: 20 }}>Delete this link?</h2>
+            <p style={{ color: 'var(--muted)' }}>
+              “{toDelete.title}” will be removed from all your devices.
+            </p>
+            <div className="modal-actions">
+              <button className="btn ghost" onClick={() => setToDelete(null)}>Cancel</button>
+              <button className="btn danger" onClick={confirmDelete}>Delete link</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className={`toast ${toast.error ? 'error' : ''}`} role="status" aria-live="polite">
+          {toast.msg}
+        </div>
+      )}
     </div>
   )
 }
