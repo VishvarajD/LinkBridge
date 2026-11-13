@@ -3,16 +3,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
-      "source": "/",
-      "destination": "/Home.html"
-    },
-    {
       "source": "/linkbridge",
-      "destination": "/index.html"
+      "destination": "/linkbridge/index.html"
     },
     {
       "source": "/linkbridge/:path*",
-      "destination": "/index.html"
+      "destination": "/linkbridge/index.html"
     }
   ]
 }
