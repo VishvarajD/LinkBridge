@@ -4,7 +4,7 @@ import { defineConfig } from 'vite'
 import { resolve } from 'path'
 import { fileURLToPath } from 'url'
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url))
+const rootDir = fileURLToPath(new URL('.', import.meta.url))
 
 export default defineConfig({
   plugins: [react()],
@@ -12,8 +12,8 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
-        home: resolve(__dirname, 'index.html'),
-        linkbridge: resolve(__dirname, 'linkbridge/index.html'),
+        home: resolve(rootDir, 'index.html'),
+        linkbridge: resolve(rootDir, 'linkbridge/index.html'),
       },
     },
   },
