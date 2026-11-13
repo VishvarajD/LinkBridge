@@ -309,6 +309,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-icon"><Link2 size={20} /></div>
+      
           <span>Link<span className="brand-accent">Bridge</span></span>
         </div>
 
