@@ -4,8 +4,7 @@
   "redirects": [
     {
       "source": "/",
-      "destination": "/linkbridge",
-      "permanent": false
+      "destination": "/Home.html"
     }
   ],
   "rewrites": [
