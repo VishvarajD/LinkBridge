@@ -7,5 +7,15 @@
       "destination": "/linkbridge",
       "permanent": false
     }
+  ],
+  "rewrites": [
+    {
+      "source": "/linkbridge",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/linkbridge/:path*",
+      "destination": "/index.html"
+    }
   ]
 }
