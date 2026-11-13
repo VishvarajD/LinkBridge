@@ -13,7 +13,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         home: resolve(rootDir, 'index.html'),
-        linkbridge: resolve(rootDir, 'linkbridge/index.html'),
+        linkbridge: resolve(rootDir, 'index.html'),
       },
     },
   },

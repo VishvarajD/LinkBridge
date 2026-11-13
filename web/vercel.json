@@ -1,14 +1,13 @@
-
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "rewrites": [
-    {
-      "source": "/linkbridge",
-      "destination": "/linkbridge/index.html"
-    },
-    {
-      "source": "/linkbridge/:path*",
-      "destination": "/linkbridge/index.html"
-    }
-  ]
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "rewrites": [
+        {
+            "source": "/linkbridge",
+            "destination": "/index.html"
+        },
+        {
+            "source": "/linkbridge/:path*",
+            "destination": "/index.html"
+        }
+    ]
 }
